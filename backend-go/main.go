@@ -383,6 +383,7 @@ CREATE INDEX IF NOT EXISTS rebalance_transfers_pending_idx ON rebalance_transfer
 		`ALTER TABLE share_links ADD COLUMN download_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE split_files ADD COLUMN manifest_checksum TEXT`,
 		`ALTER TABLE oauth_states ADD COLUMN target_account_id TEXT`,
+		`ALTER TABLE share_links ADD COLUMN split_id TEXT`,
 		`ALTER TABLE upload_sessions ADD COLUMN reservation_id TEXT`,
 		`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`,
 	} {
@@ -4490,11 +4491,25 @@ func (a *App) publicPermission(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "SHARE_FAILED", "Unable to load file.")
 		return
 	}
+	var logicalSplitID string
+	_ = a.DB.QueryRow(`SELECT sf.id FROM split_files sf JOIN split_parts sp ON sp.split_id=sf.id WHERE sp.file_id=? AND sf.user_id=? AND sf.status='complete'`, fileID, user.ID).Scan(&logicalSplitID)
 	var controls struct { Password string `json:"password"`; MaxDownloads int64 `json:"maxDownloads"` }
 	if r.Body != nil { _ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&controls) }
 	if controls.MaxDownloads < 0 { writeError(w,400,"BAD_REQUEST","maxDownloads cannot be negative."); return }
 	passwordHash := ""
 	if controls.Password != "" { if len(controls.Password)<8 { writeError(w,400,"WEAK_PASSWORD","Share password must be at least 8 characters."); return }; h,_:=bcrypt.GenerateFromPassword([]byte(controls.Password),bcrypt.DefaultCost); passwordHash=string(h) }
+	// A logical split is served only through PanDrive's merge stream. Do not make
+	// any physical Drive part public, even temporarily.
+	if logicalSplitID != "" {
+		expiresAt := strings.TrimSpace(r.URL.Query().Get("expiresAt"))
+		if expiresAt != "" { if _, err := time.Parse(time.RFC3339, expiresAt); err != nil { writeError(w,400,"BAD_REQUEST","expiresAt must be an RFC3339 timestamp."); return } }
+		scheme, host := "http", r.Host; if r.TLS != nil || r.Header.Get("X-Forwarded-Proto")=="https" { scheme="https" }; if fwd:=r.Header.Get("X-Forwarded-Host");fwd!="" { host=strings.TrimSpace(strings.Split(fwd,",")[0]) }
+		shareID:=randomID(); pageURL:=scheme+"://"+host+"/s/"+shareID
+		_,err:=a.DB.Exec(`INSERT INTO share_links (id,user_id,file_id,connected_account_id,provider_file_id,permission_id,url,expires_at,auto_revoke,password_hash,max_downloads,split_id) VALUES (?,?,?,?,?,?,?,?,1,?,?,?)`,shareID,user.ID,fileID,accountID,providerFileID,"",pageURL,nullIfEmpty(expiresAt),nullIfEmpty(passwordHash),nullIfZero(controls.MaxDownloads),logicalSplitID)
+		if err!=nil { writeError(w,500,"SHARE_FAILED","Unable to save split share link.");return }
+		a.logActivity(r,user.ID,accountID,"split_share","split",logicalSplitID,name,size,"Logical split link created")
+		writeJSON(w,http.StatusOK,map[string]string{"status":"ok","url":pageURL,"shareId":shareID});return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -4548,8 +4563,8 @@ func (a *App) publicPermission(w http.ResponseWriter, r *http.Request) {
 		host = strings.TrimSpace(strings.Split(fwd, ",")[0])
 	}
 	pageURL := scheme + "://" + host + "/s/" + shareID
-	if _, err := a.DB.Exec(`INSERT INTO share_links (id,user_id,file_id,connected_account_id,provider_file_id,permission_id,url,expires_at,auto_revoke,password_hash,max_downloads) VALUES (?,?,?,?,?,?,?,?,1,?,?)`,
-		shareID, user.ID, fileID, accountID, providerFileID, perm.ID, pageURL, nullIfEmpty(expiresAt), nullIfEmpty(passwordHash), nullIfZero(controls.MaxDownloads)); err != nil {
+	if _, err := a.DB.Exec(`INSERT INTO share_links (id,user_id,file_id,connected_account_id,provider_file_id,permission_id,url,expires_at,auto_revoke,password_hash,max_downloads,split_id) VALUES (?,?,?,?,?,?,?,?,1,?,?,?)`,
+		shareID, user.ID, fileID, accountID, providerFileID, perm.ID, pageURL, nullIfEmpty(expiresAt), nullIfEmpty(passwordHash), nullIfZero(controls.MaxDownloads), nullIfEmpty(logicalSplitID)); err != nil {
 		writeError(w, 500, "SHARE_FAILED", "Link created in Drive but could not be saved locally.")
 		return
 	}
@@ -4874,12 +4889,12 @@ func (a *App) revokeShare(w http.ResponseWriter, r *http.Request) {
 // download button that points at Google directly (browser -> Google; the VPS sends only this HTML).
 func (a *App) sharePage(w http.ResponseWriter, r *http.Request) {
 	shareID := r.PathValue("id")
-	var name, mimeType, storedURL, expiresAt, passwordHash string
+	var name, mimeType, storedURL, expiresAt, passwordHash, ownerID, splitID string
 	var size int64
 	var maxDownloads sql.NullInt64
-	err := a.DB.QueryRow(`SELECT COALESCE(f.name,''), COALESCE(f.mime_type,''), s.url, COALESCE(s.expires_at,''), COALESCE(f.size_bytes,0), COALESCE(s.password_hash,''), s.max_downloads
+	err := a.DB.QueryRow(`SELECT COALESCE(f.name,''), COALESCE(f.mime_type,''), s.url, COALESCE(s.expires_at,''), COALESCE(f.size_bytes,0), COALESCE(s.password_hash,''), s.max_downloads, s.user_id, COALESCE(s.split_id,'')
 		FROM share_links s LEFT JOIN files f ON f.id=s.file_id
-		WHERE s.id=? AND s.revoked_at IS NULL`, shareID).Scan(&name, &mimeType, &storedURL, &expiresAt, &size, &passwordHash, &maxDownloads)
+		WHERE s.id=? AND s.revoked_at IS NULL`, shareID).Scan(&name, &mimeType, &storedURL, &expiresAt, &size, &passwordHash, &maxDownloads, &ownerID, &splitID)
 	if err != nil {
 		http.Error(w, `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;background:#0f172a;color:#e2e8f0;display:grid;place-items:center;height:100vh"><div style="text-align:center"><h1>404</h1><p>Link tidak ditemukan atau sudah dicabut.</p></div>`, http.StatusNotFound)
 		return
@@ -4900,6 +4915,10 @@ func (a *App) sharePage(w http.ResponseWriter, r *http.Request) {
 	if maxDownloads.Valid && maxDownloads.Int64 > 0 {
 		res, err := a.DB.Exec(`UPDATE share_links SET download_count=download_count+1 WHERE id=? AND revoked_at IS NULL AND download_count < max_downloads`, shareID)
 		if err != nil { http.Error(w,"Link check gagal.",500); return }; n,_:=res.RowsAffected(); if n != 1 { w.Header().Set("Retry-After","60"); http.Error(w,"Batas unduhan link tercapai.",http.StatusTooManyRequests); return }
+	}
+	if r.Method == http.MethodPost && splitID != "" {
+		a.streamSplitDownload(w, r, ownerID, splitID)
+		return
 	}
 	if r.Method == http.MethodPost { // redirect after validated download reservation
 		var providerFileID string; _=a.DB.QueryRow(`SELECT provider_file_id FROM share_links WHERE id=?`,shareID).Scan(&providerFileID)
