@@ -75,13 +75,3 @@ jobs:
             ## Stable latest download URL
             `https://github.com/jhopan/PanDrive-Server/releases/latest`
 
-      - name: Replace latest channel
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create latest backend-go/release/pandrive-* backend-go/release/SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "PanDrive Server Latest ($GITHUB_REF_NAME)" \
-            --notes "Latest rolling build from $GITHUB_REF_NAME. For a pinned version, use the $GITHUB_REF_NAME release."
