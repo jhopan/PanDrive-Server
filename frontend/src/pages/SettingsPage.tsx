@@ -14,6 +14,7 @@ import { getStoredUser, getAccessToken, clearAuthSession } from '@/lib/auth'
 type AdminUser = { id: string; name: string; email: string; role: string; disabled: boolean; createdAt: string; connectedAccounts: number; files: number }
 type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; needsReconnect?: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
 type OAuthConfig = { id: string; label: string; status: 'active' | 'disabled'; quotaUsed: number; quotaLimit: number }
+type DriveBackupSettings = { accountId: string; accountEmail: string; retentionDays: number; enabled: boolean }
 
 function providerLabel(provider: string) {
   if (provider === 's3') return 'S3 Storage'
@@ -80,6 +81,12 @@ export function SettingsPage() {
   const [restoreFile, setRestoreFile] = useState<File | null>(null)
   const [restoreMessage, setRestoreMessage] = useState('')
   const [restoreSuccess, setRestoreSuccess] = useState(false)
+  const [driveBackup, setDriveBackup] = useState<DriveBackupSettings | null>(null)
+  const [driveBackupAccountId, setDriveBackupAccountId] = useState('')
+  const [driveBackupLoading, setDriveBackupLoading] = useState(true)
+  const [driveBackupBusy, setDriveBackupBusy] = useState(false)
+  const [driveBackupMessage, setDriveBackupMessage] = useState('')
+  const [driveBackupSuccess, setDriveBackupSuccess] = useState(false)
 
   async function downloadBackup() {
     setDownloadingBackup(true)
@@ -158,6 +165,52 @@ export function SettingsPage() {
       setRestoreMessage(err.message || 'Failed to restore database.')
     } finally {
       setRestoringBackup(false)
+    }
+  }
+
+  async function loadDriveBackup() {
+    setDriveBackupLoading(true)
+    try {
+      const settings = await apiFetch<DriveBackupSettings>('/settings/backup-drive')
+      setDriveBackup(settings)
+      setDriveBackupAccountId(settings.accountId || '')
+    } catch (error) {
+      setDriveBackup(null)
+      setDriveBackupMessage(error instanceof Error ? error.message : 'Failed to load off-VPS backup settings.')
+      setDriveBackupSuccess(false)
+    } finally {
+      setDriveBackupLoading(false)
+    }
+  }
+
+  async function saveDriveBackup() {
+    setDriveBackupBusy(true)
+    setDriveBackupMessage('')
+    try {
+      await apiFetch('/settings/backup-drive', { method: 'PUT', body: JSON.stringify({ accountId: driveBackupAccountId }) })
+      await loadDriveBackup()
+      setDriveBackupSuccess(true)
+      setDriveBackupMessage(driveBackupAccountId ? 'Encrypted off-VPS backup enabled.' : 'Off-VPS backup disabled. No backup will leave this server.')
+    } catch (error) {
+      setDriveBackupSuccess(false)
+      setDriveBackupMessage(error instanceof Error ? error.message : 'Failed to save off-VPS backup settings.')
+    } finally {
+      setDriveBackupBusy(false)
+    }
+  }
+
+  async function runDriveBackup() {
+    setDriveBackupBusy(true)
+    setDriveBackupMessage('')
+    try {
+      await apiFetch('/settings/backup-drive/run', { method: 'POST' })
+      setDriveBackupSuccess(true)
+      setDriveBackupMessage('Encrypted backup uploaded to Google Drive.')
+    } catch (error) {
+      setDriveBackupSuccess(false)
+      setDriveBackupMessage(error instanceof Error ? error.message : 'Failed to run encrypted off-VPS backup.')
+    } finally {
+      setDriveBackupBusy(false)
     }
   }
 
@@ -287,6 +340,7 @@ export function SettingsPage() {
 
   useEffect(() => {
     load().catch((error) => setMessage(error instanceof Error ? error.message : 'Failed to load settings'))
+    loadDriveBackup().catch(() => undefined)
     apiFetch<{ threshold: number; accountsPerConfig: number }>('/settings/api-quota').then(d => {
       setAPIThreshold(String(d.threshold))
       setAccountsPerConfig(String(d.accountsPerConfig))
@@ -495,8 +549,6 @@ export function SettingsPage() {
           </Card>
 
 
-          <OAuthConfigManager />
-
           <Card className="p-4">
             <h2 className="text-[16px] font-bold">Connected Storage Accounts</h2>
             <div className="mt-3.5 grid gap-3">
@@ -592,6 +644,30 @@ export function SettingsPage() {
                 {updatingSystem ? 'Updating...' : 'Update Code'}
               </Button>
             </div>
+          </Card>
+
+          <Card className="p-4">
+            <div className="flex flex-col gap-3 border-b border-slate-100 pb-3 dark:border-slate-800 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <h2 className="text-[16px] font-bold">Encrypted off-VPS backup</h2>
+                <p className="mt-1 text-[13px] text-slate-500">Opt in by selecting a connected Google Drive account. PanDrive encrypts each SQLite snapshot with AES-GCM before upload and keeps seven latest backups.</p>
+              </div>
+              <span className={driveBackup?.enabled ? 'text-xs font-semibold text-emerald-700 dark:text-emerald-400' : 'text-xs font-semibold text-slate-500'}>{driveBackup?.enabled ? 'Enabled' : 'Not enabled'}</span>
+            </div>
+            {driveBackupLoading ? <p className="mt-3 text-sm text-slate-500">Loading backup settings...</p> : <div className="mt-3 grid gap-3">
+              {accounts.filter((account) => account.provider === 'google_drive' && account.status === 'connected').length === 0 ? <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-600 dark:bg-slate-900/60 dark:text-slate-300">Connect a Google Drive account before enabling off-VPS backups.</p> : <label className="grid gap-1.5 text-sm font-semibold">Backup destination
+                <select className="h-11 rounded-xl border border-slate-300 bg-transparent px-3 text-sm dark:border-slate-700" value={driveBackupAccountId} onChange={(event) => setDriveBackupAccountId(event.target.value)} disabled={driveBackupBusy}>
+                  <option value="">Disabled, keep backups on this server</option>
+                  {accounts.filter((account) => account.provider === 'google_drive' && account.status === 'connected').map((account) => <option key={account.id} value={account.id}>{account.displayName || account.email}</option>)}
+                </select>
+              </label>}
+              {driveBackup?.enabled && driveBackup.accountEmail ? <p className="text-xs text-slate-500">Current destination: <span className="break-all font-semibold text-slate-700 dark:text-slate-300">{driveBackup.accountEmail}</span>. Retention: {driveBackup.retentionDays} latest backups.</p> : null}
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <Button size="sm" onClick={saveDriveBackup} disabled={driveBackupBusy || (accounts.filter((account) => account.provider === 'google_drive' && account.status === 'connected').length === 0 && Boolean(driveBackupAccountId))}>{driveBackupBusy ? 'Saving...' : 'Save backup settings'}</Button>
+                <Button size="sm" variant="outline" onClick={runDriveBackup} disabled={driveBackupBusy || !driveBackup?.enabled}>{driveBackupBusy ? 'Running backup...' : 'Run backup now'}</Button>
+              </div>
+              {driveBackupMessage ? <p role="status" className={driveBackupSuccess ? 'rounded-xl bg-emerald-50 p-3 text-sm text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300' : 'rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-300'}>{driveBackupMessage}</p> : null}
+            </div>}
           </Card>
 
           <Card className="overflow-hidden p-3.5">

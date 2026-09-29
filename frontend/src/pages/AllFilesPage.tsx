@@ -19,6 +19,7 @@ import { API_URL, apiFetch, formatBytes, formatDate } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
 import { createPlyr, ensurePlyr } from '@/lib/plyr'
 import { getPreviewKind, officeViewerUrl } from '@/lib/preview'
+import { requireHealthySplit } from '@/lib/split-health'
 import type { FileItem, FolderItem } from '@/data/drive-data'
 import { useUpload, type FolderUploadPlan } from '@/context/UploadContext'
 import { useDriveLayoutActions } from '@/layouts/DriveLayout'
@@ -457,6 +458,8 @@ export function AllFilesPage() {
     setContextMenu({ x: 0, y: 0, file: null })
     try {
       if (file.kind === 'video' && file.splitParts) {
+        const health = await apiFetch<{ status: string }>(`/files/${encodeURIComponent(file.id)}/split-health`)
+        requireHealthySplit(health)
         const token = getAccessToken()
         if (!token) throw new Error('Session expired')
         setPreviewUrl(`${API_URL}/files/${encodeURIComponent(file.id)}/stream?token=${encodeURIComponent(token)}`)
@@ -925,9 +928,17 @@ export function AllFilesPage() {
       <DummyModal open={shareOpen} title="Share Link" description={activeFile?.name ?? ''} onClose={() => setShareOpen(false)}>
         <div className="grid gap-4">
           <div>
-            <label className="text-xs font-bold text-slate-500 block mb-1">PanDrive Public Share Link (No GDrive login required)</label>
+            <label className="text-xs font-bold text-slate-500 block mb-1">PanDrive Public Share Link (No Google Drive login required)</label>
             <Input value={shareUrl} readOnly />
           </div>
+          {activeFile?.splitParts ? (
+            <div className="rounded-xl border border-violet-200 bg-violet-50 p-3 text-sm text-violet-950">
+              <p className="font-bold">VPS merge download</p>
+              <p className="mt-1 text-xs text-violet-800">Full file: {formatBytes(activeFile.sizeBytes)}. PanDrive merges split parts on the VPS. Each download uses about {formatBytes(Number(activeFile.sizeBytes) * 2)} of VPS bandwidth.</p>
+            </div>
+          ) : (
+            <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">Direct Google Drive delivery. File data goes from Google Drive to recipient.</p>
+          )}
           <div className="flex justify-end gap-3">
             <Button variant="outline" onClick={() => setShareOpen(false)}>Close</Button>
             <Button onClick={copyShareLink}>{copiedShareLink ? <CheckCircle className="h-4 w-4" /> : null}{copiedShareLink ? 'Copied!' : 'Copy Link'}</Button>

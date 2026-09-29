@@ -14,6 +14,8 @@ type OAuthConfig = {
   createdAt: string
   quotaUsed: number
   quotaLimit: number
+  accountsAssigned: number
+  accountsCap: number
 }
 
 export function OAuthConfigManager() {
@@ -144,11 +146,13 @@ export function OAuthConfigManager() {
                   </div>
                 </div>
 
-                <div className="text-xs text-slate-500 mb-2">
-                  Quota: {cfg.quotaUsed.toLocaleString()} / {cfg.quotaLimit.toLocaleString()} requests per 100s
-                </div>
+                <dl className="mb-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-slate-500 sm:grid-cols-3">
+                  <div><dt className="font-medium text-slate-700 dark:text-slate-300">Assigned accounts</dt><dd>{cfg.accountsAssigned} / {cfg.accountsCap}</dd></div>
+                  <div><dt className="font-medium text-slate-700 dark:text-slate-300">API window</dt><dd>{cfg.quotaUsed.toLocaleString()} / {cfg.quotaLimit.toLocaleString()} requests</dd></div>
+                  <div><dt className="font-medium text-slate-700 dark:text-slate-300">Window</dt><dd>100 seconds</dd></div>
+                </dl>
 
-                <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden">
+                <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden" aria-label={`API window: ${cfg.quotaUsed} of ${cfg.quotaLimit} requests`}>
                   <div
                     className={`absolute inset-y-0 left-0 rounded-full transition-all ${isNearLimit ? 'bg-orange-500' : 'bg-blue-500'}`}
                     style={{ width: `${Math.min(quotaPercent, 100)}%` }}

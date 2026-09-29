@@ -26,6 +26,11 @@ type Share = {
   accountEmail: string
   expiresAt?: string | null
   expired?: boolean
+  downloadCount: number
+  maxDownloads?: number | null
+  shareMode: 'direct_google' | 'vps_merge'
+  splitName?: string
+  splitSizeBytes?: string
 }
 
 export function SharedPage() {
@@ -158,6 +163,16 @@ export function SharedPage() {
                     {formatBytes(share.sizeBytes)} · {share.accountEmail || 'unknown account'}
                     {share.createdAt ? <> · shared {formatDate(share.createdAt)}</> : null}
                   </p>
+                  <p className="mt-0.5 text-[11px] text-slate-500">
+                    {share.downloadCount} download{share.downloadCount === 1 ? '' : 's'}{share.maxDownloads != null ? ` of ${share.maxDownloads}` : ' · no download limit'}
+                  </p>
+                  {share.shareMode === 'vps_merge' ? (
+                    <p className="mt-0.5 text-[11px] font-semibold text-violet-700">
+                      VPS merge · {share.splitName || share.name} · {formatBytes(share.splitSizeBytes || share.sizeBytes)} · VPS bandwidth uses 2x file size
+                    </p>
+                  ) : (
+                    <p className="mt-0.5 text-[11px] text-slate-500">Direct Google Drive download</p>
+                  )}
                   {share.expiresAt ? (
                     <p className={`mt-0.5 text-[11px] font-semibold ${share.expired ? 'text-red-600' : 'text-slate-500'}`}>
                       {share.expired ? 'Expired ' : 'Expiring '}{formatDate(share.expiresAt)} — will be revoked automatically

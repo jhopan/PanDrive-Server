@@ -669,6 +669,9 @@ func (a *App) Router() http.Handler {
 	mux.HandleFunc("POST /uploads/split/{id}/detach", a.requireAuth(a.detachIncompleteSplit))
 	mux.HandleFunc("GET /files/{id}/split-health", a.requireAuth(a.splitHealth))
 	mux.HandleFunc("GET /settings/api-quota", a.requireAuth(a.getAPIQuotaSettings))
+	mux.HandleFunc("GET /settings/backup-drive", a.requireAuth(a.getDriveBackupSettings))
+	mux.HandleFunc("PUT /settings/backup-drive", a.requireAuth(a.putDriveBackupSettings))
+	mux.HandleFunc("POST /settings/backup-drive/run", a.requireAuth(a.runDriveBackup))
 	mux.HandleFunc("PUT /settings/api-quota", a.requireAuth(a.putAPIQuotaSettings))
 	mux.HandleFunc("POST /rebalance/analyze", a.requireAuth(a.rebalanceAnalyze))
 	mux.HandleFunc("POST /rebalance/execute", a.requireAuth(a.rebalanceExecute))
@@ -812,12 +815,19 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) getGoogleConfig(w http.ResponseWriter, r *http.Request) {
 	user := r.Context().Value(userKey).(authUser)
+	accountCap := 5
+	if value := a.settingValue("google_api_accounts_per_config"); value != "" {
+		if cap, err := strconv.Atoi(value); err == nil && cap > 0 {
+			accountCap = cap
+		}
+	}
 	rows, err := a.DB.Query(`
 		SELECT p.id, p.label, p.redirect_uri, p.status, COALESCE(p.last_used_at,''), p.created_at,
-		       COALESCE(q.request_count, 0), COALESCE(q.window_start, '')
-		FROM provider_configs p 
-		LEFT JOIN provider_config_quota q ON q.provider_config_id = p.id 
-		WHERE p.user_id=? AND p.provider='google_drive' 
+		       COALESCE(q.request_count, 0), COALESCE(q.window_start, ''),
+		       (SELECT COUNT(*) FROM connected_accounts c WHERE c.provider_config_id=p.id AND c.status='connected')
+		FROM provider_configs p
+		LEFT JOIN provider_config_quota q ON q.provider_config_id = p.id
+		WHERE p.user_id=? AND p.provider='google_drive'
 		ORDER BY p.created_at ASC`, user.ID)
 	if err != nil {
 		writeError(w, 500, "CONFIG_FAILED", "Unable to list configs.")
@@ -828,8 +838,8 @@ func (a *App) getGoogleConfig(w http.ResponseWriter, r *http.Request) {
 	windowStart := time.Now().UTC().Add(-100 * time.Second).Format(time.RFC3339Nano)
 	for rows.Next() {
 		var id, label, redirectURI, status, lastUsed, createdAt, quotaWindowStart string
-		var requestCount int
-		if err := rows.Scan(&id, &label, &redirectURI, &status, &lastUsed, &createdAt, &requestCount, &quotaWindowStart); err != nil {
+		var requestCount, accountsAssigned int
+		if err := rows.Scan(&id, &label, &redirectURI, &status, &lastUsed, &createdAt, &requestCount, &quotaWindowStart, &accountsAssigned); err != nil {
 			continue
 		}
 		// Reset count if window expired
@@ -840,6 +850,7 @@ func (a *App) getGoogleConfig(w http.ResponseWriter, r *http.Request) {
 			"id": id, "label": label, "redirectUri": redirectURI, "status": status,
 			"lastUsedAt": lastUsed, "createdAt": createdAt,
 			"quotaUsed": requestCount, "quotaLimit": a.apiThreshold(),
+			"accountsAssigned": accountsAssigned, "accountsCap": accountCap,
 		})
 	}
 	defaultRedirect := "http://" + r.Host + "/connected-accounts/google/callback"
@@ -1101,19 +1112,39 @@ func (a *App) systemUpdate(w http.ResponseWriter, r *http.Request) {
 // migrateAccountConfig starts a real OAuth reconnect using the chosen config.
 // Callback verifies the same Google account before replacing its refresh token/config.
 func (a *App) migrateAccountConfig(w http.ResponseWriter, r *http.Request) {
-	user:=r.Context().Value(userKey).(authUser); accountID:=r.PathValue("id")
-	var body struct{ TargetConfigID string `json:"targetConfigId"` }
-	if err:=decodeJSON(r,&body);err!=nil||body.TargetConfigID=="" { writeError(w,400,"BAD_REQUEST","targetConfigId is required.");return }
-	var encryptedID,redirectURI,scopes string
-	err:=a.DB.QueryRow(`SELECT client_id_encrypted,redirect_uri,scopes FROM provider_configs WHERE id=? AND user_id=? AND provider='google_drive' AND status='active'`,body.TargetConfigID,user.ID).Scan(&encryptedID,&redirectURI,&scopes)
-	if err!=nil { writeError(w,404,"CONFIG_NOT_FOUND","Target OAuth config not found.");return }
+	user := r.Context().Value(userKey).(authUser)
+	accountID := r.PathValue("id")
+	var body struct {
+		TargetConfigID string `json:"targetConfigId"`
+	}
+	if err := decodeJSON(r, &body); err != nil || body.TargetConfigID == "" {
+		writeError(w, 400, "BAD_REQUEST", "targetConfigId is required.")
+		return
+	}
+	var encryptedID, redirectURI, scopes string
+	err := a.DB.QueryRow(`SELECT client_id_encrypted,redirect_uri,scopes FROM provider_configs WHERE id=? AND user_id=? AND provider='google_drive' AND status='active'`, body.TargetConfigID, user.ID).Scan(&encryptedID, &redirectURI, &scopes)
+	if err != nil {
+		writeError(w, 404, "CONFIG_NOT_FOUND", "Target OAuth config not found.")
+		return
+	}
 	var providerAccountID string
-	if err:=a.DB.QueryRow(`SELECT provider_account_id FROM connected_accounts WHERE id=? AND user_id=?`,accountID,user.ID).Scan(&providerAccountID);err!=nil { writeError(w,404,"ACCOUNT_NOT_FOUND","Connected account not found.");return }
-	clientID,err:=a.decrypt(encryptedID);if err!=nil { writeError(w,500,"CONFIG_FAILED","Unable to read OAuth config.");return }
-	state:=randomToken();_,err=a.DB.Exec(`INSERT INTO oauth_states (id,user_id,provider_config_id,flow,state_hash,expires_at,target_account_id) VALUES (?,?,?,?,?,?,?)`,randomID(),user.ID,body.TargetConfigID,"migrate",hashToken(state),time.Now().Add(10*time.Minute).UTC().Format(time.RFC3339Nano),accountID)
-	if err!=nil { writeError(w,500,"OAUTH_STATE_FAILED","Unable to start config migration.");return }
-	conf:=oauth2.Config{ClientID:clientID,Endpoint:a.GoogleEndpoint,RedirectURL:redirectURI,Scopes:strings.Fields(scopes)}
-	writeJSON(w,200,map[string]string{"url":conf.AuthCodeURL(state,oauth2.AccessTypeOffline,oauth2.ApprovalForce)})
+	if err := a.DB.QueryRow(`SELECT provider_account_id FROM connected_accounts WHERE id=? AND user_id=?`, accountID, user.ID).Scan(&providerAccountID); err != nil {
+		writeError(w, 404, "ACCOUNT_NOT_FOUND", "Connected account not found.")
+		return
+	}
+	clientID, err := a.decrypt(encryptedID)
+	if err != nil {
+		writeError(w, 500, "CONFIG_FAILED", "Unable to read OAuth config.")
+		return
+	}
+	state := randomToken()
+	_, err = a.DB.Exec(`INSERT INTO oauth_states (id,user_id,provider_config_id,flow,state_hash,expires_at,target_account_id) VALUES (?,?,?,?,?,?,?)`, randomID(), user.ID, body.TargetConfigID, "migrate", hashToken(state), time.Now().Add(10*time.Minute).UTC().Format(time.RFC3339Nano), accountID)
+	if err != nil {
+		writeError(w, 500, "OAUTH_STATE_FAILED", "Unable to start config migration.")
+		return
+	}
+	conf := oauth2.Config{ClientID: clientID, Endpoint: a.GoogleEndpoint, RedirectURL: redirectURI, Scopes: strings.Fields(scopes)}
+	writeJSON(w, 200, map[string]string{"url": conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce)})
 }
 
 func (a *App) googleConnectURL(w http.ResponseWriter, r *http.Request) {
@@ -1991,7 +2022,9 @@ func (a *App) initResumableUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "UPLOAD_INIT_FAILED", "Unable to save upload session.")
 		return
 	}
-	if body.ReservationID != "" { _, _ = a.DB.Exec(`UPDATE upload_reservations SET status='consumed' WHERE id=? AND status='reserved'`, body.ReservationID) }
+	if body.ReservationID != "" {
+		_, _ = a.DB.Exec(`UPDATE upload_reservations SET status='consumed' WHERE id=? AND status='reserved'`, body.ReservationID)
+	}
 	writeJSON(w, http.StatusCreated, map[string]string{"sessionId": sessionID, "provider": "google_drive"})
 }
 
@@ -2144,12 +2177,20 @@ func (a *App) resumableChunk(w http.ResponseWriter, r *http.Request) {
 		_ = a.DB.QueryRow(`SELECT part_count FROM split_files WHERE id=?`, splitID.String).Scan(&want)
 		_ = a.DB.QueryRow(`SELECT COUNT(*) FROM split_parts WHERE split_id=?`, splitID.String).Scan(&have)
 		if want > 0 && have == want {
-			var logicalName, logicalMime string; var logicalSize int64
-			_ = a.DB.QueryRow(`SELECT name,mime_type,size_bytes FROM split_files WHERE id=?`, splitID.String).Scan(&logicalName,&logicalMime,&logicalSize)
-			rows, _ := a.DB.Query(`SELECT sp.part_index,sp.size_bytes,COALESCE(f.checksum,'') FROM split_parts sp JOIN files f ON f.id=sp.file_id WHERE sp.split_id=? ORDER BY sp.part_index`,splitID.String)
-			manifestParts:=[]splitManifestPart{}
-			if rows!=nil { for rows.Next(){ var p splitManifestPart; _=rows.Scan(&p.Index,&p.Size,&p.Checksum); manifestParts=append(manifestParts,p) }; rows.Close() }
-			manifest,_:=splitManifest(logicalName,logicalMime,logicalSize,want,manifestParts)
+			var logicalName, logicalMime string
+			var logicalSize int64
+			_ = a.DB.QueryRow(`SELECT name,mime_type,size_bytes FROM split_files WHERE id=?`, splitID.String).Scan(&logicalName, &logicalMime, &logicalSize)
+			rows, _ := a.DB.Query(`SELECT sp.part_index,sp.size_bytes,COALESCE(f.checksum,'') FROM split_parts sp JOIN files f ON f.id=sp.file_id WHERE sp.split_id=? ORDER BY sp.part_index`, splitID.String)
+			manifestParts := []splitManifestPart{}
+			if rows != nil {
+				for rows.Next() {
+					var p splitManifestPart
+					_ = rows.Scan(&p.Index, &p.Size, &p.Checksum)
+					manifestParts = append(manifestParts, p)
+				}
+				rows.Close()
+			}
+			manifest, _ := splitManifest(logicalName, logicalMime, logicalSize, want, manifestParts)
 			_, _ = a.DB.Exec(`UPDATE split_files SET status='complete',manifest_checksum=? WHERE id=?`, manifest, splitID.String)
 			a.logActivity(r, user.ID, accountID, "split_upload_done", "split", splitID.String, fileName, size, "All parts uploaded")
 			a.notify(user.ID, "Upload ter-split selesai", fmt.Sprintf("%s lengkap (%d part).", fileName, want), "white_check_mark", "default")
@@ -2293,15 +2334,26 @@ func (a *App) selectUploadTarget(w http.ResponseWriter, r *http.Request) {
 // response. With a Range header it serves exactly the requested window: parts outside
 // the window are skipped, boundary parts get an adjusted Range against Google. This is
 // what makes both resume-after-disconnect and video seek work on split files.
-type splitManifestPart struct { Index int; Size int64; Checksum string }
+type splitManifestPart struct {
+	Index    int
+	Size     int64
+	Checksum string
+}
 
 // splitManifest identifies exact logical split composition without reading file bytes.
 func splitManifest(name, mime string, size int64, count int, parts []splitManifestPart) (string, bool) {
-	if len(parts) != count { return "", false }
-	sort.Slice(parts, func(i,j int) bool { return parts[i].Index < parts[j].Index })
+	if len(parts) != count {
+		return "", false
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].Index < parts[j].Index })
 	h := sha256.New()
 	fmt.Fprintf(h, "pandrive-split-v1\n%s\n%s\n%d\n%d\n", name, mime, size, count)
-	for _, p := range parts { if p.Checksum == "" { return "", false }; fmt.Fprintf(h, "%d\n%d\n%s\n", p.Index, p.Size, p.Checksum) }
+	for _, p := range parts {
+		if p.Checksum == "" {
+			return "", false
+		}
+		fmt.Fprintf(h, "%d\n%d\n%s\n", p.Index, p.Size, p.Checksum)
+	}
 	return hex.EncodeToString(h.Sum(nil)), true
 }
 
@@ -3094,13 +3146,48 @@ func (a *App) splitHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a2 := "not_ok"
-	if healthy { a2 = "ok" }
+	if healthy {
+		a2 = "ok"
+	}
 	var manifest string
-	_ = a.DB.QueryRow(`SELECT COALESCE(manifest_checksum,'') FROM split_files WHERE id=?`,splitID).Scan(&manifest)
+	_ = a.DB.QueryRow(`SELECT COALESCE(manifest_checksum,'') FROM split_files WHERE id=?`, splitID).Scan(&manifest)
 	writeJSON(w, http.StatusOK, map[string]any{"status": a2, "splitStatus": status, "manifestChecksum": manifest, "manifestAvailable": manifest != "", "parts": parts})
 }
 
 // getAPIQuotaSettings returns the current API threshold + accounts-per-config cap.
+// backupDriveAccountSetting is opt-in: no database backup leaves the VPS until the
+// owner explicitly selects a connected Drive account in Settings.
+func (a *App) backupDriveAccountSetting() string { return a.settingValue("backup_drive_account_id") }
+
+func (a *App) getDriveBackupSettings(w http.ResponseWriter, r *http.Request) {
+	user:=r.Context().Value(userKey).(authUser); id:=a.backupDriveAccountSetting(); var email string
+	if id!="" { _=a.DB.QueryRow(`SELECT email FROM connected_accounts WHERE id=? AND user_id=?`,id,user.ID).Scan(&email) }
+	writeJSON(w,200,map[string]any{"accountId":id,"accountEmail":email,"retentionDays":7,"enabled":id!=""})
+}
+func (a *App) putDriveBackupSettings(w http.ResponseWriter, r *http.Request) {
+	user:=r.Context().Value(userKey).(authUser);var body struct{ AccountID string `json:"accountId"` };if err:=decodeJSON(r,&body);err!=nil {writeError(w,400,"BAD_REQUEST","Invalid backup settings.");return}
+	if body.AccountID!="" {var n int;if err:=a.DB.QueryRow(`SELECT COUNT(*) FROM connected_accounts WHERE id=? AND user_id=? AND status='connected'`,body.AccountID,user.ID).Scan(&n);err!=nil||n!=1 {writeError(w,400,"BAD_REQUEST","Select a connected Drive account.");return}}
+	_ = a.setSetting("backup_drive_account_id",body.AccountID);writeJSON(w,200,map[string]string{"status":"ok"})
+}
+func (a *App) encryptBytes(value []byte) ([]byte,error) { block,err:=aes.NewCipher(a.encryptionKey());if err!=nil{return nil,err};gcm,err:=cipher.NewGCM(block);if err!=nil{return nil,err};nonce:=make([]byte,gcm.NonceSize());if _,err=rand.Read(nonce);err!=nil{return nil,err};return append(nonce,gcm.Seal(nil,nonce,value,nil)...),nil }
+func (a *App) uploadDriveBackup(ctx context.Context, accountID string, payload []byte, name string) error {
+	token,err:=a.getGoogleToken(ctx,accountID,false);if err!=nil{return err}
+	meta,_:=json.Marshal(map[string]string{"name":name,"mimeType":"application/octet-stream"})
+	boundary:="pandrive-backup";body:=bytes.NewBuffer(nil);fmt.Fprintf(body,"--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n%s\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n",boundary,meta,boundary);body.Write(payload);fmt.Fprintf(body,"\r\n--%s--\r\n",boundary)
+	req,err:=http.NewRequestWithContext(ctx,http.MethodPost,a.GoogleUploadAPIURL+"?uploadType=multipart",body);if err!=nil{return err};req.Header.Set("Authorization","Bearer "+token);req.Header.Set("Content-Type","multipart/related; boundary="+boundary)
+	resp,err:=a.HTTPClient.Do(req);if err!=nil{return err};defer resp.Body.Close();if resp.StatusCode<200||resp.StatusCode>=300{return fmt.Errorf("Drive backup upload rejected (%d)",resp.StatusCode)};return a.pruneDriveBackups(ctx,accountID,7)
+}
+func (a *App) pruneDriveBackups(ctx context.Context, accountID string, keep int) error {
+	token,err:=a.getGoogleToken(ctx,accountID,false);if err!=nil{return err};u:=a.GoogleDriveAPIURL+"?q="+url.QueryEscape("name contains 'pandrive-db-' and trashed = false")+"&orderBy=createdTime desc&fields=files(id,name,createdTime)"
+	req,err:=http.NewRequestWithContext(ctx,http.MethodGet,u,nil);if err!=nil{return err};req.Header.Set("Authorization","Bearer "+token);resp,err:=a.HTTPClient.Do(req);if err!=nil{return err};defer resp.Body.Close();if resp.StatusCode<200||resp.StatusCode>=300{return fmt.Errorf("Drive backup list rejected (%d)",resp.StatusCode)}
+	var out struct{ Files []struct{ ID string `json:"id"` } `json:"files"` };if err:=json.NewDecoder(io.LimitReader(resp.Body,1<<20)).Decode(&out);err!=nil{return err};for _,f:=range out.Files[keep:] {d,err:=http.NewRequestWithContext(ctx,http.MethodDelete,a.GoogleDriveAPIURL+"/"+url.PathEscape(f.ID),nil);if err!=nil{continue};d.Header.Set("Authorization","Bearer "+token);r,err:=a.HTTPClient.Do(d);if err==nil{r.Body.Close()} };return nil
+}
+func (a *App) makeDriveBackup(ctx context.Context, userID string) error {
+	accountID:=a.backupDriveAccountSetting();if accountID=="" {return errors.New("off-VPS backup is not configured")};var n int;if err:=a.DB.QueryRow(`SELECT COUNT(*) FROM connected_accounts WHERE id=? AND user_id=?`,accountID,userID).Scan(&n);err!=nil||n!=1{return errors.New("backup account is unavailable")}
+	dbPath:=dbFilePathFromURL(a.Config.DatabaseURL);if dbPath=="" {return errors.New("database path unavailable")};tmp:=dbPath+".drive-backup.tmp";defer os.Remove(tmp);if _,err:=a.DB.Exec(`VACUUM INTO ?`,tmp);err!=nil{return err};raw,err:=os.ReadFile(tmp);if err!=nil{return err};ciphertext,err:=a.encryptBytes(raw);if err!=nil{return err};name:="pandrive-db-"+time.Now().UTC().Format("20060102T150405Z")+".sqlite.aesgcm";return a.uploadDriveBackup(ctx,accountID,ciphertext,name)
+}
+func (a *App) runDriveBackup(w http.ResponseWriter, r *http.Request) { user:=r.Context().Value(userKey).(authUser);ctx,cancel:=context.WithTimeout(r.Context(),2*time.Minute);defer cancel();if err:=a.makeDriveBackup(ctx,user.ID);err!=nil{writeError(w,500,"BACKUP_FAILED",err.Error());return};writeJSON(w,200,map[string]string{"status":"ok"}) }
+
 func (a *App) getAPIQuotaSettings(w http.ResponseWriter, r *http.Request) {
 	threshold := a.apiThreshold()
 	cap := 5
@@ -3306,8 +3393,18 @@ func (a *App) rebalanceExecute(w http.ResponseWriter, r *http.Request) {
 // releaseExpiredReservations returns capacity for plans never started.
 func (a *App) releaseExpiredReservations() {
 	rows, err := a.DB.Query(`SELECT id,target_connected_account_id,size_bytes FROM upload_reservations WHERE status='reserved' AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now')`)
-	if err != nil { return }; defer rows.Close()
-	for rows.Next() { var id,acct string; var size int64; if rows.Scan(&id,&acct,&size)==nil { _,_=a.DB.Exec(`UPDATE storage_accounts SET available_bytes=available_bytes+? WHERE connected_account_id=?`,size,acct); _,_=a.DB.Exec(`UPDATE upload_reservations SET status='expired' WHERE id=? AND status='reserved'`,id) } }
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, acct string
+		var size int64
+		if rows.Scan(&id, &acct, &size) == nil {
+			_, _ = a.DB.Exec(`UPDATE storage_accounts SET available_bytes=available_bytes+? WHERE connected_account_id=?`, size, acct)
+			_, _ = a.DB.Exec(`UPDATE upload_reservations SET status='expired' WHERE id=? AND status='reserved'`, id)
+		}
+	}
 }
 
 func (a *App) reconcileUploadSessions(ctx context.Context) {
@@ -4493,22 +4590,53 @@ func (a *App) publicPermission(w http.ResponseWriter, r *http.Request) {
 	}
 	var logicalSplitID string
 	_ = a.DB.QueryRow(`SELECT sf.id FROM split_files sf JOIN split_parts sp ON sp.split_id=sf.id WHERE sp.file_id=? AND sf.user_id=? AND sf.status='complete'`, fileID, user.ID).Scan(&logicalSplitID)
-	var controls struct { Password string `json:"password"`; MaxDownloads int64 `json:"maxDownloads"` }
-	if r.Body != nil { _ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&controls) }
-	if controls.MaxDownloads < 0 { writeError(w,400,"BAD_REQUEST","maxDownloads cannot be negative."); return }
+	var controls struct {
+		Password     string `json:"password"`
+		MaxDownloads int64  `json:"maxDownloads"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&controls)
+	}
+	if controls.MaxDownloads < 0 {
+		writeError(w, 400, "BAD_REQUEST", "maxDownloads cannot be negative.")
+		return
+	}
 	passwordHash := ""
-	if controls.Password != "" { if len(controls.Password)<8 { writeError(w,400,"WEAK_PASSWORD","Share password must be at least 8 characters."); return }; h,_:=bcrypt.GenerateFromPassword([]byte(controls.Password),bcrypt.DefaultCost); passwordHash=string(h) }
+	if controls.Password != "" {
+		if len(controls.Password) < 8 {
+			writeError(w, 400, "WEAK_PASSWORD", "Share password must be at least 8 characters.")
+			return
+		}
+		h, _ := bcrypt.GenerateFromPassword([]byte(controls.Password), bcrypt.DefaultCost)
+		passwordHash = string(h)
+	}
 	// A logical split is served only through PanDrive's merge stream. Do not make
 	// any physical Drive part public, even temporarily.
 	if logicalSplitID != "" {
 		expiresAt := strings.TrimSpace(r.URL.Query().Get("expiresAt"))
-		if expiresAt != "" { if _, err := time.Parse(time.RFC3339, expiresAt); err != nil { writeError(w,400,"BAD_REQUEST","expiresAt must be an RFC3339 timestamp."); return } }
-		scheme, host := "http", r.Host; if r.TLS != nil || r.Header.Get("X-Forwarded-Proto")=="https" { scheme="https" }; if fwd:=r.Header.Get("X-Forwarded-Host");fwd!="" { host=strings.TrimSpace(strings.Split(fwd,",")[0]) }
-		shareID:=randomID(); pageURL:=scheme+"://"+host+"/s/"+shareID
-		_,err:=a.DB.Exec(`INSERT INTO share_links (id,user_id,file_id,connected_account_id,provider_file_id,permission_id,url,expires_at,auto_revoke,password_hash,max_downloads,split_id) VALUES (?,?,?,?,?,?,?,?,1,?,?,?)`,shareID,user.ID,fileID,accountID,providerFileID,"",pageURL,nullIfEmpty(expiresAt),nullIfEmpty(passwordHash),nullIfZero(controls.MaxDownloads),logicalSplitID)
-		if err!=nil { writeError(w,500,"SHARE_FAILED","Unable to save split share link.");return }
-		a.logActivity(r,user.ID,accountID,"split_share","split",logicalSplitID,name,size,"Logical split link created")
-		writeJSON(w,http.StatusOK,map[string]string{"status":"ok","url":pageURL,"shareId":shareID});return
+		if expiresAt != "" {
+			if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+				writeError(w, 400, "BAD_REQUEST", "expiresAt must be an RFC3339 timestamp.")
+				return
+			}
+		}
+		scheme, host := "http", r.Host
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		if fwd := r.Header.Get("X-Forwarded-Host"); fwd != "" {
+			host = strings.TrimSpace(strings.Split(fwd, ",")[0])
+		}
+		shareID := randomID()
+		pageURL := scheme + "://" + host + "/s/" + shareID
+		_, err := a.DB.Exec(`INSERT INTO share_links (id,user_id,file_id,connected_account_id,provider_file_id,permission_id,url,expires_at,auto_revoke,password_hash,max_downloads,split_id) VALUES (?,?,?,?,?,?,?,?,1,?,?,?)`, shareID, user.ID, fileID, accountID, providerFileID, "", pageURL, nullIfEmpty(expiresAt), nullIfEmpty(passwordHash), nullIfZero(controls.MaxDownloads), logicalSplitID)
+		if err != nil {
+			writeError(w, 500, "SHARE_FAILED", "Unable to save split share link.")
+			return
+		}
+		a.logActivity(r, user.ID, accountID, "split_share", "split", logicalSplitID, name, size, "Logical split link created")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "url": pageURL, "shareId": shareID})
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
@@ -4820,10 +4948,12 @@ func (a *App) revokeInvite(w http.ResponseWriter, r *http.Request) {
 // listShares returns active public links.
 func (a *App) listShares(w http.ResponseWriter, r *http.Request) {
 	user := r.Context().Value(userKey).(authUser)
-	rows, err := a.DB.Query(`SELECT s.id,s.url,COALESCE(s.created_at,''),f.id,f.name,f.size_bytes,COALESCE(f.mime_type,''),COALESCE(c.email,''),s.expires_at,
-		CASE WHEN s.expires_at IS NOT NULL AND datetime(s.expires_at) <= datetime('now') THEN 1 ELSE 0 END
+	rows, err := a.DB.Query(`SELECT s.id,s.url,COALESCE(s.created_at,''),f.id,COALESCE(sf.name,f.name),COALESCE(sf.size_bytes,f.size_bytes),COALESCE(sf.mime_type,f.mime_type,''),COALESCE(c.email,''),s.expires_at,
+		CASE WHEN s.expires_at IS NOT NULL AND datetime(s.expires_at) <= datetime('now') THEN 1 ELSE 0 END,
+		COALESCE(s.download_count,0),s.max_downloads,COALESCE(s.split_id,''),COALESCE(sf.name,''),sf.size_bytes
 		FROM share_links s
 		JOIN files f ON f.id=s.file_id
+		LEFT JOIN split_files sf ON sf.id=s.split_id
 		LEFT JOIN connected_accounts c ON c.id=s.connected_account_id
 		WHERE s.user_id=? AND s.revoked_at IS NULL
 		ORDER BY s.id DESC`, user.ID)
@@ -4834,19 +4964,32 @@ func (a *App) listShares(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	shares := []map[string]any{}
 	for rows.Next() {
-		var id, link, createdAt, fileID, name, mimeType, email string
-		var size int64
+		var id, link, createdAt, fileID, name, mimeType, email, splitID, splitName string
+		var size, downloadCount int64
 		var expires sql.NullString
+		var maxDownloads, splitSize sql.NullInt64
 		var expired int
-		if err := rows.Scan(&id, &link, &createdAt, &fileID, &name, &size, &mimeType, &email, &expires, &expired); err != nil {
+		if err := rows.Scan(&id, &link, &createdAt, &fileID, &name, &size, &mimeType, &email, &expires, &expired, &downloadCount, &maxDownloads, &splitID, &splitName, &splitSize); err != nil {
 			writeError(w, 500, "SHARES_FAILED", "Unable to read shares.")
 			return
 		}
-		var expiresOut any
+		var expiresOut, maxDownloadsOut any
 		if expires.Valid {
 			expiresOut = expires.String
 		}
-		shares = append(shares, map[string]any{"id": id, "url": link, "createdAt": createdAt, "fileId": fileID, "name": name, "sizeBytes": fmt.Sprint(size), "mimeType": mimeType, "accountEmail": email, "expiresAt": expiresOut, "expired": expired == 1})
+		if maxDownloads.Valid {
+			maxDownloadsOut = maxDownloads.Int64
+		}
+		shareMode := "direct_google"
+		if splitID != "" {
+			shareMode = "vps_merge"
+		}
+		share := map[string]any{"id": id, "url": link, "createdAt": createdAt, "fileId": fileID, "name": name, "sizeBytes": fmt.Sprint(size), "mimeType": mimeType, "accountEmail": email, "expiresAt": expiresOut, "expired": expired == 1, "downloadCount": downloadCount, "maxDownloads": maxDownloadsOut, "shareMode": shareMode}
+		if splitID != "" {
+			share["splitName"] = splitName
+			share["splitSizeBytes"] = fmt.Sprint(splitSize.Int64)
+		}
+		shares = append(shares, share)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"shares": shares, "total": len(shares)})
 }
@@ -4909,20 +5052,38 @@ func (a *App) sharePage(w http.ResponseWriter, r *http.Request) {
 	}
 	// Password and atomically capped downloads are enforced on the branded page.
 	if passwordHash != "" {
-		if r.Method != http.MethodPost { w.Header().Set("Content-Type", "text/html; charset=utf-8"); fmt.Fprint(w, `<!doctype html><form method="post"><label>Password <input name="password" type="password"></label><button>Unduh</button></form>`); return }
-		if err := r.ParseForm(); err != nil || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(r.Form.Get("password"))) != nil { http.Error(w,"Password salah.",http.StatusUnauthorized); return }
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, `<!doctype html><form method="post"><label>Password <input name="password" type="password"></label><button>Unduh</button></form>`)
+			return
+		}
+		if err := r.ParseForm(); err != nil || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(r.Form.Get("password"))) != nil {
+			http.Error(w, "Password salah.", http.StatusUnauthorized)
+			return
+		}
 	}
 	if maxDownloads.Valid && maxDownloads.Int64 > 0 {
 		res, err := a.DB.Exec(`UPDATE share_links SET download_count=download_count+1 WHERE id=? AND revoked_at IS NULL AND download_count < max_downloads`, shareID)
-		if err != nil { http.Error(w,"Link check gagal.",500); return }; n,_:=res.RowsAffected(); if n != 1 { w.Header().Set("Retry-After","60"); http.Error(w,"Batas unduhan link tercapai.",http.StatusTooManyRequests); return }
+		if err != nil {
+			http.Error(w, "Link check gagal.", 500)
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n != 1 {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "Batas unduhan link tercapai.", http.StatusTooManyRequests)
+			return
+		}
 	}
 	if r.Method == http.MethodPost && splitID != "" {
 		a.streamSplitDownload(w, r, ownerID, splitID)
 		return
 	}
 	if r.Method == http.MethodPost { // redirect after validated download reservation
-		var providerFileID string; _=a.DB.QueryRow(`SELECT provider_file_id FROM share_links WHERE id=?`,shareID).Scan(&providerFileID)
-		http.Redirect(w,r,"https://drive.google.com/uc?export=download&id="+url.QueryEscape(providerFileID),http.StatusSeeOther); return
+		var providerFileID string
+		_ = a.DB.QueryRow(`SELECT provider_file_id FROM share_links WHERE id=?`, shareID).Scan(&providerFileID)
+		http.Redirect(w, r, "https://drive.google.com/uc?export=download&id="+url.QueryEscape(providerFileID), http.StatusSeeOther)
+		return
 	}
 
 	// Google's own download/viewer link: direct download for binary types, viewer for docs.
@@ -4963,7 +5124,12 @@ a.btn:hover{background:#1d4ed8}.foot{margin-top:20px;font-size:11px;color:#64748
 		htmlEscape(name), htmlEscape(name), htmlEscape(sizeLabel), warn, htmlEscapeAttr(driveURL))
 }
 
-func nullIfZero(n int64) any { if n <= 0 { return nil }; return n }
+func nullIfZero(n int64) any {
+	if n <= 0 {
+		return nil
+	}
+	return n
+}
 
 func htmlEscape(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&#34;")
@@ -5692,12 +5858,19 @@ func (a *App) uploadReservations(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.DB.Query(`SELECT r.id,r.file_name,r.size_bytes,r.status,COALESCE(r.created_at,''),COALESCE(r.expires_at,''),COALESCE(c.email,'')
 		FROM upload_reservations r LEFT JOIN connected_accounts c ON c.id=r.target_connected_account_id
 		WHERE r.user_id=? AND r.status IN ('reserved','uploading') ORDER BY r.created_at DESC LIMIT 200`, user.ID)
-	if err != nil { writeError(w, 500, "RESERVATIONS_FAILED", "Unable to read upload reservations."); return }
+	if err != nil {
+		writeError(w, 500, "RESERVATIONS_FAILED", "Unable to read upload reservations.")
+		return
+	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, fileName, status, createdAt, expiresAt, accountEmail string; var size int64
-		if err := rows.Scan(&id, &fileName, &size, &status, &createdAt, &expiresAt, &accountEmail); err != nil { writeError(w, 500, "RESERVATIONS_FAILED", "Unable to read upload reservations."); return }
+		var id, fileName, status, createdAt, expiresAt, accountEmail string
+		var size int64
+		if err := rows.Scan(&id, &fileName, &size, &status, &createdAt, &expiresAt, &accountEmail); err != nil {
+			writeError(w, 500, "RESERVATIONS_FAILED", "Unable to read upload reservations.")
+			return
+		}
 		items = append(items, map[string]any{"id": id, "fileName": fileName, "sizeBytes": fmt.Sprint(size), "status": status, "createdAt": createdAt, "expiresAt": expiresAt, "accountEmail": accountEmail})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})
