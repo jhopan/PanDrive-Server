@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-PanDrive Lite — Google Drive multi-account gateway. Go backend + SQLite, React (Preact-compat) frontend. Runtime target: 1 vCPU / 1 GB RAM VPS, one Go binary, SQLite WAL, no Docker/MySQL/S3.
+PanDrive Server is a Google Drive multi-account gateway. Go backend + SQLite, React (Preact-compat) frontend. Runtime target: 1 vCPU / 1 GB RAM VPS, one Go binary, SQLite WAL.
 
 ## Commands
 
