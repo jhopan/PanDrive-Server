@@ -620,9 +620,8 @@ The VPS installs and updates **from GitHub Releases** (`deploy/vps-update.sh`, i
 - Never probe an installed binary by executing it to read its version — a pre-`--version` build boots,
   runs migrations and can create a second database under a different CWD. Read
   `/opt/pandrive/.installed-version` (written on success) or the service log instead.
-- Rebrand rule: user-facing text says **PanDrive** everywhere. Legacy paths stay for data compatibility:
-  install dir `/opt/pandrive`, DB file `data/pandrive.db`, systemd unit **pandrive.service** (was 9drive.service;
-  renamed on next deploy — env `SERVICE=pandrive` in installers).
+- Rebrand rule: user-facing text says **PanDrive** everywhere. Runtime paths are install dir
+  `/opt/pandrive`, DB file `data/pandrive.db`, and systemd unit **pandrive.service**.
 
 ### 🖼️ Gallery / folder sizes / expiry / ntfy (v0.20.0)
 
