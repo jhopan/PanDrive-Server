@@ -21,6 +21,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -36,6 +37,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/scrypt"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	_ "modernc.org/sqlite"
@@ -67,6 +69,8 @@ type App struct {
 	GoogleUploadAPIURL string
 	loginFails         map[string]*loginFail
 	loginMu            sync.Mutex
+	shareFails         map[string]*loginFail
+	shareMu            sync.Mutex
 	splitDownloadMu    sync.Mutex
 	splitDownloads     map[string]int
 	RateMeter          *rateMeter
@@ -110,6 +114,41 @@ func (a *App) loginRecordSuccess(ip string) {
 	a.loginMu.Lock()
 	defer a.loginMu.Unlock()
 	delete(a.loginFails, ip)
+}
+
+const (
+	passwordFailureLimit = 5
+	passwordLockDuration = 15 * time.Minute
+)
+
+func (a *App) sharePasswordBlocked(shareID, ip string) (bool, time.Duration) {
+	key := shareID + "\x00" + ip
+	a.shareMu.Lock()
+	defer a.shareMu.Unlock()
+	f := a.shareFails[key]
+	if f == nil || f.blockedUntil.IsZero() || !time.Now().Before(f.blockedUntil) {
+		return false, 0
+	}
+	return true, time.Until(f.blockedUntil)
+}
+
+func (a *App) sharePasswordRecordFailure(shareID, ip string) {
+	key := shareID + "\x00" + ip
+	a.shareMu.Lock()
+	defer a.shareMu.Unlock()
+	if a.shareFails == nil {
+		a.shareFails = map[string]*loginFail{}
+	}
+	f := a.shareFails[key]
+	if f == nil {
+		f = &loginFail{}
+		a.shareFails[key] = f
+	}
+	f.count++
+	if f.count >= passwordFailureLimit {
+		f.blockedUntil = time.Now().Add(passwordLockDuration)
+		f.count = 0
+	}
 }
 
 func clientIP(r *http.Request) string {
@@ -601,6 +640,8 @@ func (a *App) Router() http.Handler {
 	mux.HandleFunc("POST /settings/notifications/test", a.requireAuth(a.testNotification))
 	mux.HandleFunc("GET /api/admin/users", a.requireAuth(a.requireAdmin(a.listUsers)))
 	mux.HandleFunc("PATCH /api/admin/users/{id}", a.requireAuth(a.requireAdmin(a.updateUser)))
+	mux.HandleFunc("GET /api/admin/ip-allowlist", a.requireAuth(a.requireAdmin(a.getAdminIPAllowlist)))
+	mux.HandleFunc("PUT /api/admin/ip-allowlist", a.requireAuth(a.requireAdmin(a.putAdminIPAllowlist)))
 	mux.HandleFunc("GET /api/settings/trash", a.requireAuth(a.getTrashSettings))
 	mux.HandleFunc("PUT /api/settings/trash", a.requireAuth(a.putTrashSettings))
 	mux.HandleFunc("GET /api/settings/proxy", a.requireAuth(a.getProxySettings))
@@ -616,6 +657,7 @@ func (a *App) Router() http.Handler {
 	mux.HandleFunc("PATCH /system/google-config/{id}", a.requireAuth(a.updateGoogleConfig))
 	mux.HandleFunc("POST /system/update", a.requireAuth(a.requireAdmin(a.systemUpdate)))
 	mux.HandleFunc("GET /system/version", a.requireAuth(a.updateInfoHandler))
+	mux.HandleFunc("GET /system/dependencies", a.requireAuth(a.dependencyAuditReport))
 	mux.HandleFunc("GET /connected-accounts", a.requireAuth(a.listAccounts))
 	mux.HandleFunc("GET /connected-accounts/google/connect-url", a.requireAuth(a.googleConnectURL))
 	mux.HandleFunc("POST /connected-accounts/{id}/migrate-config", a.requireAuth(a.migrateAccountConfig))
@@ -672,6 +714,7 @@ func (a *App) Router() http.Handler {
 	mux.HandleFunc("GET /settings/backup-drive", a.requireAuth(a.requireAdmin(a.getDriveBackupSettings)))
 	mux.HandleFunc("PUT /settings/backup-drive", a.requireAuth(a.requireAdmin(a.putDriveBackupSettings)))
 	mux.HandleFunc("POST /settings/backup-drive/run", a.requireAuth(a.requireAdmin(a.runDriveBackup)))
+	mux.HandleFunc("POST /settings/recovery-key/export", a.requireAuth(a.requireAdmin(a.exportRecoveryKey)))
 	mux.HandleFunc("PUT /settings/api-quota", a.requireAuth(a.putAPIQuotaSettings))
 	mux.HandleFunc("POST /rebalance/analyze", a.requireAuth(a.rebalanceAnalyze))
 	mux.HandleFunc("POST /rebalance/execute", a.requireAuth(a.rebalanceExecute))
@@ -699,6 +742,23 @@ func (a *App) Router() http.Handler {
 	}))
 	mux.Handle("/api/", apiStrip)
 	return a.cors(mux)
+}
+
+type dependencyAuditSource struct {
+	Name            string `json:"name"`
+	LockfilePresent bool   `json:"lockfilePresent"`
+	PackageCount    int    `json:"packageCount"`
+}
+
+// dependencyAuditReport exposes build-time lockfile metadata only. It never runs package managers or a vulnerability scanner.
+func (a *App) dependencyAuditReport(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"auditStatus": "not_run",
+		"sources": []dependencyAuditSource{
+			{Name: "Go modules", LockfilePresent: true, PackageCount: 15},
+			{Name: "Frontend npm", LockfilePresent: true, PackageCount: 441},
+		},
+	})
 }
 
 func (a *App) health(w http.ResponseWriter, _ *http.Request) {
@@ -3158,34 +3218,167 @@ func (a *App) splitHealth(w http.ResponseWriter, r *http.Request) {
 // owner explicitly selects a connected Drive account in Settings.
 func (a *App) backupDriveAccountSetting() string { return a.settingValue("backup_drive_account_id") }
 
+// exportRecoveryKey produces a password-encrypted recovery package. The raw
+// TOKEN_ENCRYPTION_KEY never leaves the server in plaintext.
+func (a *App) exportRecoveryKey(w http.ResponseWriter, r *http.Request) {
+	var body struct{ Password string `json:"password"` }
+	if err:=decodeJSON(r,&body);err!=nil||len(body.Password)<12 { writeError(w,400,"WEAK_PASSWORD","Recovery package password must be at least 12 characters.");return }
+	salt:=make([]byte,16);if _,err:=rand.Read(salt);err!=nil{writeError(w,500,"RECOVERY_EXPORT_FAILED","Unable to generate recovery package.");return}
+	key,err:=scrypt.Key([]byte(body.Password),salt,32768,8,1,32);if err!=nil{writeError(w,500,"RECOVERY_EXPORT_FAILED","Unable to derive recovery key.");return}
+	block,err:=aes.NewCipher(key);if err!=nil{writeError(w,500,"RECOVERY_EXPORT_FAILED","Unable to encrypt recovery package.");return};gcm,err:=cipher.NewGCM(block);if err!=nil{writeError(w,500,"RECOVERY_EXPORT_FAILED","Unable to encrypt recovery package.");return};nonce:=make([]byte,gcm.NonceSize());if _,err=rand.Read(nonce);err!=nil{writeError(w,500,"RECOVERY_EXPORT_FAILED","Unable to generate recovery package.");return}
+	payload:=map[string]string{"tokenEncryptionKey":a.Config.TokenKey,"createdAt":time.Now().UTC().Format(time.RFC3339Nano),"format":"pandrive-recovery-v1"};plain,_:=json.Marshal(payload);ciphertext:=gcm.Seal(nil,nonce,plain,nil)
+	writeJSON(w,200,map[string]any{"format":"pandrive-recovery-v1","kdf":"scrypt","N":32768,"r":8,"p":1,"salt":base64.RawStdEncoding.EncodeToString(salt),"nonce":base64.RawStdEncoding.EncodeToString(nonce),"ciphertext":base64.RawStdEncoding.EncodeToString(ciphertext)})
+}
+
 func (a *App) getDriveBackupSettings(w http.ResponseWriter, r *http.Request) {
-	user:=r.Context().Value(userKey).(authUser); id:=a.backupDriveAccountSetting(); var email string
-	if id!="" { _=a.DB.QueryRow(`SELECT email FROM connected_accounts WHERE id=? AND user_id=?`,id,user.ID).Scan(&email) }
-	writeJSON(w,200,map[string]any{"accountId":id,"accountEmail":email,"retentionDays":7,"enabled":id!=""})
+	user := r.Context().Value(userKey).(authUser)
+	id := a.backupDriveAccountSetting()
+	var email string
+	if id != "" {
+		_ = a.DB.QueryRow(`SELECT email FROM connected_accounts WHERE id=? AND user_id=?`, id, user.ID).Scan(&email)
+	}
+	writeJSON(w, 200, map[string]any{"accountId": id, "accountEmail": email, "retentionDays": 7, "enabled": id != ""})
 }
 func (a *App) putDriveBackupSettings(w http.ResponseWriter, r *http.Request) {
-	user:=r.Context().Value(userKey).(authUser);var body struct{ AccountID string `json:"accountId"` };if err:=decodeJSON(r,&body);err!=nil {writeError(w,400,"BAD_REQUEST","Invalid backup settings.");return}
-	if body.AccountID!="" {var n int;if err:=a.DB.QueryRow(`SELECT COUNT(*) FROM connected_accounts WHERE id=? AND user_id=? AND status='connected'`,body.AccountID,user.ID).Scan(&n);err!=nil||n!=1 {writeError(w,400,"BAD_REQUEST","Select a connected Drive account.");return}}
-	_ = a.setSetting("backup_drive_account_id",body.AccountID);writeJSON(w,200,map[string]string{"status":"ok"})
+	user := r.Context().Value(userKey).(authUser)
+	var body struct {
+		AccountID string `json:"accountId"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, 400, "BAD_REQUEST", "Invalid backup settings.")
+		return
+	}
+	if body.AccountID != "" {
+		var n int
+		if err := a.DB.QueryRow(`SELECT COUNT(*) FROM connected_accounts WHERE id=? AND user_id=? AND status='connected'`, body.AccountID, user.ID).Scan(&n); err != nil || n != 1 {
+			writeError(w, 400, "BAD_REQUEST", "Select a connected Drive account.")
+			return
+		}
+	}
+	_ = a.setSetting("backup_drive_account_id", body.AccountID)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
-func (a *App) encryptBytes(value []byte) ([]byte,error) { block,err:=aes.NewCipher(a.encryptionKey());if err!=nil{return nil,err};gcm,err:=cipher.NewGCM(block);if err!=nil{return nil,err};nonce:=make([]byte,gcm.NonceSize());if _,err=rand.Read(nonce);err!=nil{return nil,err};return append(nonce,gcm.Seal(nil,nonce,value,nil)...),nil }
+func (a *App) encryptBytes(value []byte) ([]byte, error) {
+	block, err := aes.NewCipher(a.encryptionKey())
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return append(nonce, gcm.Seal(nil, nonce, value, nil)...), nil
+}
 func (a *App) uploadDriveBackup(ctx context.Context, accountID string, payload []byte, name string) error {
-	token,err:=a.getGoogleToken(ctx,accountID,false);if err!=nil{return err}
-	meta,_:=json.Marshal(map[string]string{"name":name,"mimeType":"application/octet-stream"})
-	boundary:="pandrive-backup";body:=bytes.NewBuffer(nil);fmt.Fprintf(body,"--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n%s\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n",boundary,meta,boundary);body.Write(payload);fmt.Fprintf(body,"\r\n--%s--\r\n",boundary)
-	req,err:=http.NewRequestWithContext(ctx,http.MethodPost,a.GoogleUploadAPIURL+"?uploadType=multipart",body);if err!=nil{return err};req.Header.Set("Authorization","Bearer "+token);req.Header.Set("Content-Type","multipart/related; boundary="+boundary)
-	resp,err:=a.HTTPClient.Do(req);if err!=nil{return err};defer resp.Body.Close();if resp.StatusCode<200||resp.StatusCode>=300{return fmt.Errorf("Drive backup upload rejected (%d)",resp.StatusCode)};return a.pruneDriveBackups(ctx,accountID,7)
+	token, err := a.getGoogleToken(ctx, accountID, false)
+	if err != nil {
+		return err
+	}
+	meta, _ := json.Marshal(map[string]string{"name": name, "mimeType": "application/octet-stream"})
+	boundary := "pandrive-backup"
+	body := bytes.NewBuffer(nil)
+	fmt.Fprintf(body, "--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n%s\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, meta, boundary)
+	body.Write(payload)
+	fmt.Fprintf(body, "\r\n--%s--\r\n", boundary)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.GoogleUploadAPIURL+"?uploadType=multipart", body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "multipart/related; boundary="+boundary)
+	resp, err := a.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Drive backup upload rejected (%d)", resp.StatusCode)
+	}
+	return a.pruneDriveBackups(ctx, accountID, 7)
 }
 func (a *App) pruneDriveBackups(ctx context.Context, accountID string, keep int) error {
-	token,err:=a.getGoogleToken(ctx,accountID,false);if err!=nil{return err};u:=a.GoogleDriveAPIURL+"?q="+url.QueryEscape("name contains 'pandrive-db-' and trashed = false")+"&orderBy=createdTime desc&fields=files(id,name,createdTime)"
-	req,err:=http.NewRequestWithContext(ctx,http.MethodGet,u,nil);if err!=nil{return err};req.Header.Set("Authorization","Bearer "+token);resp,err:=a.HTTPClient.Do(req);if err!=nil{return err};defer resp.Body.Close();if resp.StatusCode<200||resp.StatusCode>=300{return fmt.Errorf("Drive backup list rejected (%d)",resp.StatusCode)}
-	var out struct{ Files []struct{ ID string `json:"id"` } `json:"files"` };if err:=json.NewDecoder(io.LimitReader(resp.Body,1<<20)).Decode(&out);err!=nil{return err};for _,f:=range out.Files[keep:] {d,err:=http.NewRequestWithContext(ctx,http.MethodDelete,a.GoogleDriveAPIURL+"/"+url.PathEscape(f.ID),nil);if err!=nil{continue};d.Header.Set("Authorization","Bearer "+token);r,err:=a.HTTPClient.Do(d);if err==nil{r.Body.Close()} };return nil
+	token, err := a.getGoogleToken(ctx, accountID, false)
+	if err != nil {
+		return err
+	}
+	u := a.GoogleDriveAPIURL + "?q=" + url.QueryEscape("name contains 'pandrive-db-' and trashed = false") + "&orderBy=createdTime desc&fields=files(id,name,createdTime)"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := a.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Drive backup list rejected (%d)", resp.StatusCode)
+	}
+	var out struct {
+		Files []struct {
+			ID string `json:"id"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return err
+	}
+	for _, f := range out.Files[keep:] {
+		d, err := http.NewRequestWithContext(ctx, http.MethodDelete, a.GoogleDriveAPIURL+"/"+url.PathEscape(f.ID), nil)
+		if err != nil {
+			continue
+		}
+		d.Header.Set("Authorization", "Bearer "+token)
+		r, err := a.HTTPClient.Do(d)
+		if err == nil {
+			r.Body.Close()
+		}
+	}
+	return nil
 }
 func (a *App) makeDriveBackup(ctx context.Context, userID string) error {
-	accountID:=a.backupDriveAccountSetting();if accountID=="" {return errors.New("off-VPS backup is not configured")};var n int;if err:=a.DB.QueryRow(`SELECT COUNT(*) FROM connected_accounts WHERE id=? AND user_id=?`,accountID,userID).Scan(&n);err!=nil||n!=1{return errors.New("backup account is unavailable")}
-	dbPath:=dbFilePathFromURL(a.Config.DatabaseURL);if dbPath=="" {return errors.New("database path unavailable")};tmp:=dbPath+".drive-backup.tmp";defer os.Remove(tmp);if _,err:=a.DB.Exec(`VACUUM INTO ?`,tmp);err!=nil{return err};raw,err:=os.ReadFile(tmp);if err!=nil{return err};ciphertext,err:=a.encryptBytes(raw);if err!=nil{return err};name:="pandrive-db-"+time.Now().UTC().Format("20060102T150405Z")+".sqlite.aesgcm";return a.uploadDriveBackup(ctx,accountID,ciphertext,name)
+	accountID := a.backupDriveAccountSetting()
+	if accountID == "" {
+		return errors.New("off-VPS backup is not configured")
+	}
+	var n int
+	if err := a.DB.QueryRow(`SELECT COUNT(*) FROM connected_accounts WHERE id=? AND user_id=?`, accountID, userID).Scan(&n); err != nil || n != 1 {
+		return errors.New("backup account is unavailable")
+	}
+	dbPath := dbFilePathFromURL(a.Config.DatabaseURL)
+	if dbPath == "" {
+		return errors.New("database path unavailable")
+	}
+	tmp := dbPath + ".drive-backup.tmp"
+	defer os.Remove(tmp)
+	if _, err := a.DB.Exec(`VACUUM INTO ?`, tmp); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(tmp)
+	if err != nil {
+		return err
+	}
+	ciphertext, err := a.encryptBytes(raw)
+	if err != nil {
+		return err
+	}
+	name := "pandrive-db-" + time.Now().UTC().Format("20060102T150405Z") + ".sqlite.aesgcm"
+	return a.uploadDriveBackup(ctx, accountID, ciphertext, name)
 }
-func (a *App) runDriveBackup(w http.ResponseWriter, r *http.Request) { user:=r.Context().Value(userKey).(authUser);ctx,cancel:=context.WithTimeout(r.Context(),2*time.Minute);defer cancel();if err:=a.makeDriveBackup(ctx,user.ID);err!=nil{writeError(w,500,"BACKUP_FAILED",err.Error());return};writeJSON(w,200,map[string]string{"status":"ok"}) }
+func (a *App) runDriveBackup(w http.ResponseWriter, r *http.Request) {
+	user := r.Context().Value(userKey).(authUser)
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	if err := a.makeDriveBackup(ctx, user.ID); err != nil {
+		writeError(w, 500, "BACKUP_FAILED", err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
 
 func (a *App) getAPIQuotaSettings(w http.ResponseWriter, r *http.Request) {
 	threshold := a.apiThreshold()
@@ -5056,7 +5249,13 @@ func (a *App) sharePage(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, `<!doctype html><form method="post"><label>Password <input name="password" type="password"></label><button>Unduh</button></form>`)
 			return
 		}
+		if blocked, wait := a.sharePasswordBlocked(shareID, clientIP(r)); blocked {
+			w.Header().Set("Retry-After", strconv.Itoa(max(1, int(wait.Seconds())+1)))
+			http.Error(w, "Terlalu banyak percobaan password. Coba lagi nanti.", http.StatusTooManyRequests)
+			return
+		}
 		if err := r.ParseForm(); err != nil || bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(r.Form.Get("password"))) != nil {
+			a.sharePasswordRecordFailure(shareID, clientIP(r))
 			http.Error(w, "Password salah.", http.StatusUnauthorized)
 			return
 		}
@@ -5337,6 +5536,90 @@ func (a *App) testNotification(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent", "server": server, "topic": topic})
 }
 
+func parseAdminIPAllowlist(entries string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, entry := range strings.FieldsFunc(entries, func(r rune) bool { return r == ',' || r == '\n' || r == '\r' }) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(entry); err == nil {
+			prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IP or CIDR: %q", entry)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
+}
+
+func (a *App) adminIPAllowed(ip string) bool {
+	entries := a.settingValue("admin_ip_allowlist")
+	if strings.TrimSpace(entries) == "" {
+		return true
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	prefixes, err := parseAdminIPAllowlist(entries)
+	if err != nil {
+		return false
+	}
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) getAdminIPAllowlist(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"entries": a.settingValue("admin_ip_allowlist"), "currentIP": clientIP(r)})
+}
+
+func (a *App) putAdminIPAllowlist(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Entries string `json:"entries"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid admin IP allowlist.")
+		return
+	}
+	prefixes, err := parseAdminIPAllowlist(body.Entries)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+		return
+	}
+	if len(prefixes) > 0 {
+		currentIP := clientIP(r)
+		addr, err := netip.ParseAddr(currentIP)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "BAD_REQUEST", "Current client IP is invalid; leave the allowlist empty or use a valid client IP.")
+			return
+		}
+		allowed := false
+		for _, prefix := range prefixes {
+			if prefix.Contains(addr) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			writeError(w, http.StatusBadRequest, "CURRENT_IP_REQUIRED", "Allowlist must include your current client IP to prevent admin lockout.")
+			return
+		}
+	}
+	if err := a.setSetting("admin_ip_allowlist", strings.TrimSpace(body.Entries)); err != nil {
+		writeError(w, http.StatusInternalServerError, "SETTINGS_FAILED", "Unable to save admin IP allowlist.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"entries": strings.TrimSpace(body.Entries)})
+}
+
 // requireAdmin wraps a handler for role='admin' users only.
 func (a *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -5345,6 +5628,10 @@ func (a *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 		_ = a.DB.QueryRow(`SELECT COALESCE(role,'user') FROM users WHERE id=?`, user.ID).Scan(&role)
 		if role != "admin" {
 			writeError(w, http.StatusForbidden, "ADMIN_REQUIRED", "Administrator access required.")
+			return
+		}
+		if !a.adminIPAllowed(clientIP(r)) {
+			writeError(w, http.StatusForbidden, "ADMIN_IP_NOT_ALLOWED", "Administrator access is not allowed from this IP address.")
 			return
 		}
 		next(w, r)

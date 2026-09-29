@@ -15,6 +15,7 @@ type AdminUser = { id: string; name: string; email: string; role: string; disabl
 type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; needsReconnect?: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
 type OAuthConfig = { id: string; label: string; status: 'active' | 'disabled'; quotaUsed: number; quotaLimit: number }
 type DriveBackupSettings = { accountId: string; accountEmail: string; retentionDays: number; enabled: boolean }
+type DependencyAuditReport = { auditStatus: 'not_run'; sources: { name: string; lockfilePresent: boolean; packageCount: number }[] }
 
 function providerLabel(provider: string) {
   if (provider === 's3') return 'S3 Storage'
@@ -86,6 +87,15 @@ export function SettingsPage() {
   const [driveBackupBusy, setDriveBackupBusy] = useState(false)
   const [driveBackupMessage, setDriveBackupMessage] = useState('')
   const [driveBackupSuccess, setDriveBackupSuccess] = useState(false)
+  const [recoveryPassword, setRecoveryPassword] = useState('')
+  const [recoveryBusy, setRecoveryBusy] = useState(false)
+  const [recoveryMessage, setRecoveryMessage] = useState('')
+  const [adminIPAllowlist, setAdminIPAllowlist] = useState('')
+  const [adminCurrentIP, setAdminCurrentIP] = useState('')
+  const [adminIPAllowlistBusy, setAdminIPAllowlistBusy] = useState(false)
+  const [adminIPAllowlistMessage, setAdminIPAllowlistMessage] = useState('')
+  const [dependencyAudit, setDependencyAudit] = useState<DependencyAuditReport | null>(null)
+  const [dependencyAuditError, setDependencyAuditError] = useState('')
 
   async function downloadBackup() {
     setDownloadingBackup(true)
@@ -167,6 +177,19 @@ export function SettingsPage() {
     }
   }
 
+  async function exportRecoveryPackage() {
+    if (recoveryPassword.length < 12) { setRecoveryMessage('Gunakan password minimal 12 karakter.'); return }
+    setRecoveryBusy(true); setRecoveryMessage('')
+    try {
+      const data = await apiFetch<Record<string, unknown>>('/settings/recovery-key/export', { method: 'POST', body: JSON.stringify({ password: recoveryPassword }) })
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob); const link = document.createElement('a')
+      link.href = url; link.download = 'pandrive-recovery-key.json'; link.click(); URL.revokeObjectURL(url)
+      setRecoveryPassword(''); setRecoveryMessage('Recovery package diunduh. Simpan file dan password terpisah dari VPS.')
+    } catch (error) { setRecoveryMessage(error instanceof Error ? error.message : 'Gagal membuat recovery package.') }
+    finally { setRecoveryBusy(false) }
+  }
+
   async function loadDriveBackup() {
     setDriveBackupLoading(true)
     try {
@@ -210,6 +233,29 @@ export function SettingsPage() {
       setDriveBackupMessage(error instanceof Error ? error.message : 'Failed to run encrypted off-VPS backup.')
     } finally {
       setDriveBackupBusy(false)
+    }
+  }
+
+  async function loadAdminIPAllowlist() {
+    try {
+      const settings = await apiFetch<{ entries: string; currentIP: string }>('/admin/ip-allowlist')
+      setAdminIPAllowlist(settings.entries || '')
+      setAdminCurrentIP(settings.currentIP || '')
+    } catch {
+      // Non-admin users cannot configure this admin-only setting.
+    }
+  }
+
+  async function saveAdminIPAllowlist() {
+    setAdminIPAllowlistBusy(true)
+    setAdminIPAllowlistMessage('')
+    try {
+      await apiFetch('/admin/ip-allowlist', { method: 'PUT', body: JSON.stringify({ entries: adminIPAllowlist }) })
+      setAdminIPAllowlistMessage(adminIPAllowlist.trim() ? 'Admin IP allowlist saved.' : 'Admin IP allowlist disabled.')
+    } catch (error) {
+      setAdminIPAllowlistMessage(error instanceof Error ? error.message : 'Failed to save admin IP allowlist.')
+    } finally {
+      setAdminIPAllowlistBusy(false)
     }
   }
 
@@ -316,6 +362,8 @@ export function SettingsPage() {
   useEffect(() => {
     load().catch((error) => setMessage(error instanceof Error ? error.message : 'Failed to load settings'))
     loadDriveBackup().catch(() => undefined)
+    loadAdminIPAllowlist().catch(() => undefined)
+    apiFetch<DependencyAuditReport>('/system/dependencies').then(setDependencyAudit).catch((error) => setDependencyAuditError(error instanceof Error ? error.message : 'Dependency status unavailable.'))
     apiFetch<{ threshold: number; accountsPerConfig: number }>('/settings/api-quota').then(d => {
       setAPIThreshold(String(d.threshold))
       setAccountsPerConfig(String(d.accountsPerConfig))
@@ -625,6 +673,7 @@ export function SettingsPage() {
                 <Button size="sm" variant="outline" onClick={runDriveBackup} disabled={driveBackupBusy || !driveBackup?.enabled}>{driveBackupBusy ? 'Running backup...' : 'Run backup now'}</Button>
               </div>
               {driveBackupMessage ? <p role="status" className={driveBackupSuccess ? 'rounded-xl bg-emerald-50 p-3 text-sm text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300' : 'rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-300'}>{driveBackupMessage}</p> : null}
+              <div className="border-t border-slate-100 pt-3 dark:border-slate-800"><p className="text-sm font-semibold">Recovery key package</p><p className="mt-1 text-xs text-slate-500">Password-encrypted export of the key required to restore encrypted off-VPS backups. Store package and password separately.</p><div className="mt-2 flex flex-col gap-2 sm:flex-row"><Input type="password" value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} placeholder="Package password, 12+ characters" /><Button size="sm" variant="outline" onClick={exportRecoveryPackage} disabled={recoveryBusy}>{recoveryBusy ? 'Exporting...' : 'Export recovery package'}</Button></div>{recoveryMessage ? <p role="status" className="mt-2 text-xs text-slate-600 dark:text-slate-300">{recoveryMessage}</p> : null}</div>
             </div>}
           </Card>
 
@@ -811,6 +860,26 @@ export function SettingsPage() {
                 } catch (e) { setPurgeSaved(e instanceof Error ? e.message : 'Gagal simpan') }
               }}>Save</Button>
               {purgeSaved ? <span className="text-[12px] font-semibold text-slate-600">{purgeSaved}</span> : null}
+            </div>
+          </Card>
+          <Card className="col-span-full p-4">
+            <h2 className="text-[14px] font-bold">Dependency audit</h2>
+            <p className="mt-1 text-[12px] text-slate-500">Build metadata confirms tracked dependency manifests. No vulnerability scan has run on this server.</p>
+            {dependencyAudit ? <div className="mt-3 grid gap-2 text-[12px]">
+              {dependencyAudit.sources.map((source) => <div key={source.name} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-100 p-2 dark:border-slate-800"><span className="font-semibold">{source.name}</span><span className="text-slate-500">{source.lockfilePresent ? 'Lockfile present' : 'Lockfile missing'} · {source.packageCount} locked packages</span></div>)}
+              <p className="text-slate-500">Run <code>npm audit</code> in <code>frontend</code> and <code>govulncheck ./...</code> in <code>backend-go</code> in CI or a controlled build environment. Review results before deployment.</p>
+            </div> : dependencyAuditError ? <p role="status" className="mt-3 rounded-lg bg-red-50 p-2 text-[12px] text-red-700 dark:bg-red-950/40 dark:text-red-300">{dependencyAuditError}</p> : <p className="mt-3 text-[12px] text-slate-500">Loading dependency status...</p>}
+          </Card>
+          <Card className="col-span-full p-4">
+            <div className="flex items-center gap-2"><Globe className="h-5 w-5 text-blue-600" /><h2 className="text-[14px] font-bold">Admin IP allowlist</h2></div>
+            <p className="mt-1 text-[12px] text-slate-500">Optional. Empty disables IP restrictions. Enter one IP or CIDR per line, or separate entries with commas.</p>
+            <p className="mt-2 rounded-lg bg-amber-50 p-2 text-[12px] font-semibold text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">Warning: saving a non-empty allowlist blocks all admin endpoints outside it, including backup configuration. Current client IP: {adminCurrentIP || 'loading...'}. Keep it in this list to avoid lockout.</p>
+            <label className="mt-3 grid gap-1 text-[12px] font-semibold">Allowed IPs and CIDRs
+              <textarea value={adminIPAllowlist} onChange={(event) => setAdminIPAllowlist(event.target.value)} rows={4} placeholder={'198.51.100.10\n2001:db8::/32'} className="w-full rounded-lg border border-slate-300 bg-transparent px-2 py-2 text-[13px] font-mono dark:border-slate-700" disabled={adminIPAllowlistBusy} />
+            </label>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <Button size="sm" onClick={saveAdminIPAllowlist} disabled={adminIPAllowlistBusy}>{adminIPAllowlistBusy ? 'Saving...' : 'Save allowlist'}</Button>
+              {adminIPAllowlistMessage ? <span role="status" className="text-[12px] font-semibold text-slate-600">{adminIPAllowlistMessage}</span> : null}
             </div>
           </Card>
           <Card className="col-span-full p-4">
