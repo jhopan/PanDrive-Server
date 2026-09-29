@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Embed dist
+        run: |
+          rm -rf backend-go/dist
+          cp -r frontend/dist backend-go/dist
+
+      - name: Cross compile
+        working-directory: backend-go
+        run: |
+          mkdir -p release
+          LDFLAGS="-s -w -X main.buildVersion=${GITHUB_REF_NAME}"
+          for t in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS="${t%/*}"; GOARCH="${t#*/}"
+            SUFFIX=""
+            [ "$GOOS" = "windows" ] && SUFFIX=".exe"
+            echo "Building pandrive-${GOOS}-${GOARCH}${SUFFIX}"
+            GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o "release/pandrive-${GOOS}-${GOARCH}${SUFFIX}" .
+          done
+
+      - name: Checksums
+        working-directory: backend-go/release
+        run: sha256sum pandrive-* > SHA256SUMS && cat SHA256SUMS
+
+      - name: Version release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PanDrive Server ${{ github.ref_name }}
+          files: |
+            backend-go/release/pandrive-*
+            backend-go/release/SHA256SUMS
+          generate_release_notes: true
+          body: |
+            ## PanDrive Server ${{ github.ref_name }}
+
+            This pinned version includes the generated change log below, followed by its release assets.
+
+            ## Assets
+            - `pandrive-linux-amd64` — Linux x86_64
+            - `pandrive-linux-arm64` — Linux ARM64
+            - `pandrive-windows-amd64.exe` — Windows x86_64
+            - `pandrive-windows-arm64.exe` — Windows ARM64
+            - `pandrive-darwin-amd64` / `pandrive-darwin-arm64` — macOS
+            - `SHA256SUMS` — checksum verification
+
+            ## Stable latest download URL
+            `https://github.com/jhopan/PanDrive-Server/releases/latest`
+
+      - name: Replace latest channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create latest backend-go/release/pandrive-* backend-go/release/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "PanDrive Server Latest ($GITHUB_REF_NAME)" \
+            --notes "Latest rolling build from $GITHUB_REF_NAME. For a pinned version, use the $GITHUB_REF_NAME release."

@@ -1,0 +1,33 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Secrets
+.env
+backend/.env
+backend/.env.local
+backend/.env.*.local
+
+# Databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+backups/
+
+# Local env is non-secret by default, keep example in repo instead.
+frontend/.env.local
+frontend/.env.*.local
+backend-go/*.exe
+
+backend-go/*.exe~
+
+# Build artifacts
+backend-go/dist/
+backend-go/release/
+backend-go/pandrive-*
+backend-go/backend-go.exe
+backend-go/pandrive-linux-*
+
+backend-go/data/*.db*
