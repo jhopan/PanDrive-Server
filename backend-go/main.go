@@ -614,7 +614,7 @@ func (a *App) Router() http.Handler {
 	mux.HandleFunc("POST /system/google-config", a.requireAuth(a.saveGoogleConfig))
 	mux.HandleFunc("DELETE /system/google-config/{id}", a.requireAuth(a.deleteGoogleConfig))
 	mux.HandleFunc("PATCH /system/google-config/{id}", a.requireAuth(a.updateGoogleConfig))
-	mux.HandleFunc("POST /system/update", a.requireAuth(a.systemUpdate))
+	mux.HandleFunc("POST /system/update", a.requireAuth(a.requireAdmin(a.systemUpdate)))
 	mux.HandleFunc("GET /system/version", a.requireAuth(a.updateInfoHandler))
 	mux.HandleFunc("GET /connected-accounts", a.requireAuth(a.listAccounts))
 	mux.HandleFunc("GET /connected-accounts/google/connect-url", a.requireAuth(a.googleConnectURL))
@@ -669,9 +669,9 @@ func (a *App) Router() http.Handler {
 	mux.HandleFunc("POST /uploads/split/{id}/detach", a.requireAuth(a.detachIncompleteSplit))
 	mux.HandleFunc("GET /files/{id}/split-health", a.requireAuth(a.splitHealth))
 	mux.HandleFunc("GET /settings/api-quota", a.requireAuth(a.getAPIQuotaSettings))
-	mux.HandleFunc("GET /settings/backup-drive", a.requireAuth(a.getDriveBackupSettings))
-	mux.HandleFunc("PUT /settings/backup-drive", a.requireAuth(a.putDriveBackupSettings))
-	mux.HandleFunc("POST /settings/backup-drive/run", a.requireAuth(a.runDriveBackup))
+	mux.HandleFunc("GET /settings/backup-drive", a.requireAuth(a.requireAdmin(a.getDriveBackupSettings)))
+	mux.HandleFunc("PUT /settings/backup-drive", a.requireAuth(a.requireAdmin(a.putDriveBackupSettings)))
+	mux.HandleFunc("POST /settings/backup-drive/run", a.requireAuth(a.requireAdmin(a.runDriveBackup)))
 	mux.HandleFunc("PUT /settings/api-quota", a.requireAuth(a.putAPIQuotaSettings))
 	mux.HandleFunc("POST /rebalance/analyze", a.requireAuth(a.rebalanceAnalyze))
 	mux.HandleFunc("POST /rebalance/execute", a.requireAuth(a.rebalanceExecute))
@@ -1103,10 +1103,9 @@ func (a *App) startUpdateChecker() {
 }
 
 func (a *App) systemUpdate(w http.ResponseWriter, r *http.Request) {
-	go func() {
-		exec.Command("git", "pull", "origin", "main").Run()
-	}()
-	writeJSON(w, http.StatusOK, map[string]string{"message": "System update initiated"})
+	// Releases are checksum-verified by pandrive-update. Never run mutable git pull
+	// from an HTTP request, even for admins.
+	writeError(w, http.StatusConflict, "USE_RELEASE_UPDATER", "Use pandrive-update to install a checksum-verified release.")
 }
 
 // migrateAccountConfig starts a real OAuth reconnect using the chosen config.

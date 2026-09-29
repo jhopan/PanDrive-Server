@@ -57,7 +57,6 @@ export function SettingsPage() {
   const [profileImageUrl, setProfileImageUrl] = useState('')
   const [avatarError, setAvatarError] = useState(false)
   const [selectedAccountId, setSelectedAccountId] = useState('')
-  const [updatingSystem, setUpdatingSystem] = useState(false)
   const [updateInfo, setUpdateInfo] = useState<{ current: string; latest: string; updateAvailable: boolean; releaseUrl: string; assetUrl: string; assetName: string; checkedAt: string; error?: string } | null>(null)
   const [checkingUpdate, setCheckingUpdate] = useState(false)
   const [updateModalOpen, setUpdateModalOpen] = useState(false)
@@ -277,30 +276,6 @@ export function SettingsPage() {
   useEffect(() => {
     checkForUpdates().catch(() => undefined)
   }, [])
-
-  async function runSystemUpdate() {
-    setUpdatingSystem(true)
-    setMessage('')
-    setUpdateLog('Initiating system update in the background...\n')
-    setUpdateFinished(false)
-    setUpdateSuccess(null)
-    setReconnectCount(0)
-    setUpdateModalTitle('System Updating')
-    setUpdateModalOpen(true)
-
-    try {
-      await apiFetch<{ message: string }>('/system/update', { method: 'POST' })
-      setIsPollingLog(true)
-    } catch (error) {
-      setUpdateModalTitle('System Update Failed')
-      const errMsg = error instanceof Error ? error.message : 'System update failed to initiate.'
-      setUpdateLog((prev) => prev + `\nError: ${errMsg}`)
-      setUpdateFinished(true)
-      setUpdateSuccess(false)
-    } finally {
-      setUpdatingSystem(false)
-    }
-  }
 
 
   const selectedAccount = accounts.find((account) => account.id === selectedAccountId) ?? accounts[0] ?? null
@@ -622,27 +597,10 @@ export function SettingsPage() {
             </div>
           </Card>
 
-          <Card className="overflow-hidden p-3.5">
-            <div className="flex flex-col gap-3.5 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <div className="flex items-center gap-2.5">
-                  <RefreshCw className="h-5 w-5 text-blue-600" />
-                  <h2 className="text-[16px] font-bold">System Update</h2>
-                </div>
-                <p className="mt-1 text-[13px] text-slate-500">
-                  Only for git checkouts: pulls the latest code from GitHub. Release binaries update via the Updates card above.
-                </p>
-              </div>
-              <Button
-                className="w-full sm:w-32"
-                variant="outline"
-                size="sm"
-                onClick={runSystemUpdate}
-                disabled={updatingSystem}
-              >
-                <RefreshCw className={updatingSystem ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />
-                {updatingSystem ? 'Updating...' : 'Update Code'}
-              </Button>
+          <Card className="p-4">
+            <div className="flex items-center gap-2.5">
+              <RefreshCw className="h-5 w-5 text-blue-600" />
+              <div><h2 className="text-[16px] font-bold">Release updates</h2><p className="mt-1 text-[13px] text-slate-500">Install server updates with checksum verification: <code>pandrive-update</code>. Source-tree git pull is intentionally disabled.</p></div>
             </div>
           </Card>
 
